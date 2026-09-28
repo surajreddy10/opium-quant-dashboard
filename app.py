@@ -16,7 +16,6 @@ warnings.filterwarnings('ignore')
 # ==========================================
 st.set_page_config(page_title="OpiumFly Quant Dashboard", layout="wide", initial_sidebar_state="expanded")
 st.title("🦅 OpiumFly Institutional Quant Dashboard")
-st.markdown("Execute machine-learning options backtests with deep statistical performance analysis.")
 
 # ==========================================
 # SHARED BLACK-SCHOLES ENGINE
@@ -55,7 +54,7 @@ class FlyBrain:
 def run_swarm_engine():
     tickers = ['QQQ', 'SPY', 'DIA', 'IWM', 'OEF']
     
-    with st.spinner(f"Fetching 60-day market data for {', '.join(tickers)}..."):
+    with st.spinner(f"Fetching 60-day market data for Swarm ({', '.join(tickers)})..."):
         data = yf.download(tickers, period="60d", interval="5m", group_by="ticker", progress=False)
         valid_times = data[tickers[0]].dropna().index
     
@@ -121,7 +120,10 @@ def run_swarm_engine():
 # ==========================================
 # ENGINE 2 & 3: ML COMPOUNDING
 # ==========================================
-def run_ml_engine(ticker, is_aggressive=False):
+def run_ml_engine(mode):
+    is_aggressive = (mode == "Aggressive")
+    ticker = "SPY" if is_aggressive else "QQQ"
+    
     with st.spinner(f"Fetching market data for {ticker}..."):
         data = yf.Ticker(ticker).history(period="59d", interval="5m")
         if data.empty: data = yf.Ticker(ticker).history(period="1mo", interval="5m")
@@ -129,7 +131,7 @@ def run_ml_engine(ticker, is_aggressive=False):
             st.error("Could not retrieve market data from Yahoo Finance.")
             return None, None, None, None
 
-    with st.spinner("Calculating quantitative features..."):
+    with st.spinner(f"Calculating {'Aggressive' if is_aggressive else 'Defensive'} quantitative features..."):
         data['SMA_20'] = data['Close'].rolling(window=20).mean()
         data['STD_20'] = data['Close'].rolling(window=20).std()
         
@@ -138,8 +140,9 @@ def run_ml_engine(ticker, is_aggressive=False):
         data['Upper_Band'] = data['SMA_20'] + (band_mult * data['STD_20'])
         
         if not is_aggressive: data['EMA_100'] = data['Close'].ewm(span=100, adjust=False).mean()
-        data['EMA_50'] = data['Close'].ewm(span=50, adjust=False).mean()
-        data['EMA_200'] = data['Close'].ewm(span=200, adjust=False).mean()
+        if is_aggressive:
+            data['EMA_50'] = data['Close'].ewm(span=50, adjust=False).mean()
+            data['EMA_200'] = data['Close'].ewm(span=200, adjust=False).mean()
         
         data['Z_Score'] = (data['Close'] - data['SMA_20']) / data['STD_20']
         data['ROC_5'] = data['Close'].pct_change(5) * 100 
@@ -175,9 +178,9 @@ def run_ml_engine(ticker, is_aggressive=False):
         features = ['RSI', 'Z_Score', 'Volatility', 'ROC_5']
         if not is_aggressive: features.insert(3, 'Price_EMA_Dist')
         
-        rf_call = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+        rf_call = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42, min_samples_leaf=1 if is_aggressive else 5)
         rf_call.fit(train_data[features], train_data['Call_Target'])
-        rf_put = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+        rf_put = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42, min_samples_leaf=1 if is_aggressive else 5)
         rf_put.fit(train_data[features], train_data['Put_Target'])
 
     portfolio = {"cash": 100000.0, "initial_balance": 100000.0}
@@ -193,7 +196,7 @@ def run_ml_engine(ticker, is_aggressive=False):
     progress_bar = st.progress(0)
     total_steps = len(trade_cycles)
 
-    with st.spinner("Running Trading Simulation..."):
+    with st.spinner("Running 60-Day Forward Simulation..."):
         for cycle_num, cycle_dates in enumerate(trade_cycles, 1):
             cycle_data = data[data['Date'].isin(cycle_dates)]
             
@@ -203,7 +206,7 @@ def run_ml_engine(ticker, is_aggressive=False):
                 is_last_candle = (i == len(cycle_data) - 1)
                 
                 current_price = float(row['Close'])
-                r, sigma = 0.04, float(row['Volatility']) if pd.notna(row['Volatility']) else 0.15 
+                r, sigma = 0.04, float(row['Volatility']) if pd.notna(row['Volatility']) else (0.15 if is_aggressive else 0.18)
                 
                 if active_option is not None:
                     T_rem = active_option['T_start'] - ((index - active_option['entry_time']).total_seconds() / (365 * 24 * 3600))
@@ -229,17 +232,15 @@ def run_ml_engine(ticker, is_aggressive=False):
                     feats = pd.DataFrame([[row[f] for f in features]], columns=features)
                     vol_safe = row['Volatility'] < (row['Vol_SMA'] * (1.75 if is_aggressive else 1.20))
                     
-                    if is_aggressive:
-                        bullish, bearish = row['EMA_50'] > row['EMA_200'], row['EMA_50'] < row['EMA_200']
-                        rsi_call, rsi_put = 45, 55
-                    else:
-                        bullish, bearish = True, True 
-                        rsi_call, rsi_put = 40, 60
+                    bullish = (row['EMA_50'] > row['EMA_200']) if is_aggressive else True
+                    bearish = (row['EMA_50'] < row['EMA_200']) if is_aggressive else True
+                    rsi_call = 45 if is_aggressive else 40
+                    rsi_put = 55 if is_aggressive else 60
                     
                     if bullish and current_price < row['Lower_Band'] and row['RSI'] < rsi_call and vol_safe:
                         prob = rf_call.predict_proba(feats)[0][1]
                         if prob >= CONFIDENCE:
-                            alloc = min(0.25 if is_aggressive else 0.10, max(0.05 if is_aggressive else 0.02, (prob - 0.45)))
+                            alloc = min(0.25 if is_aggressive else 0.10, max(0.05 if is_aggressive else 0.02, (prob - 0.45) * (1.0 if is_aggressive else 0.5)))
                             cost_per = black_scholes(current_price, current_price, DTE, r, sigma, 'call') * 100
                             contracts = int((portfolio['cash'] * alloc) / cost_per)
                             if contracts > 0:
@@ -250,7 +251,7 @@ def run_ml_engine(ticker, is_aggressive=False):
                     elif bearish and current_price > row['Upper_Band'] and row['RSI'] > rsi_put and vol_safe:
                         prob = rf_put.predict_proba(feats)[0][1]
                         if prob >= CONFIDENCE:
-                            alloc = min(0.25 if is_aggressive else 0.10, max(0.05 if is_aggressive else 0.02, (prob - 0.45)))
+                            alloc = min(0.25 if is_aggressive else 0.10, max(0.05 if is_aggressive else 0.02, (prob - 0.45) * (1.0 if is_aggressive else 0.5)))
                             cost_per = black_scholes(current_price, current_price, DTE, r, sigma, 'put') * 100
                             contracts = int((portfolio['cash'] * alloc) / cost_per)
                             if contracts > 0:
@@ -290,19 +291,19 @@ if run_button:
     if engine_choice == "Swarm Intelligence (Multi-Index)":
         timestamps, curve, trade_pnls, port = run_swarm_engine()
     elif engine_choice == "QQQ Safe Compounding (V7)":
-        timestamps, curve, trade_pnls, port = run_ml_engine("QQQ", is_aggressive=False)
+        timestamps, curve, trade_pnls, port = run_ml_engine("Safe")
     else:
-        timestamps, curve, trade_pnls, port = run_ml_engine("SPY", is_aggressive=True)
+        timestamps, curve, trade_pnls, port = run_ml_engine("Aggressive")
         
-    if timestamps:
-        # Calculate Detailed Statistics
+    if timestamps and curve:
+        # 1. Statistical Calculations
         net_profit = port['cash'] - port['initial_balance']
         roi = (net_profit / port['initial_balance']) * 100
         
         eq_series = pd.Series(curve)
         rolling_max = eq_series.cummax()
         drawdowns = (eq_series - rolling_max) / rolling_max * 100
-        max_dd = drawdowns.min()
+        max_dd = drawdowns.min() if not drawdowns.empty else 0.0
         
         wins = [x for x in trade_pnls if x > 0]
         losses = [x for x in trade_pnls if x <= 0]
@@ -315,15 +316,14 @@ if run_button:
         gross_loss = abs(sum(losses))
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
         
-        # UI: Top Metrics Row
-        st.subheader("🏁 Institutional Audit & Statistics")
+        # 2. Key Performance Indicators Layout
+        st.subheader(f"🏁 Performance Audit: {engine_choice.split(' ')[0]}")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Net Return", f"${net_profit:+,.2f}", f"{roi:+.2f}%")
         col2.metric("Maximum Drawdown", f"{max_dd:.2f}%")
         col3.metric("Win Rate", f"{win_rate:.1f}%", f"{len(wins)}W / {len(losses)}L")
         col4.metric("Profit Factor", f"{profit_factor:.2f}x")
         
-        # UI: Secondary Metrics Row
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Ending Capital", f"${port['cash']:,.2f}")
         c2.metric("Total Trades Executed", total_trades)
@@ -332,16 +332,16 @@ if run_button:
         
         st.markdown("---")
         
-        # VISUALIZATIONS: Three Distinct Graphs
+        # 3. Dedicated Visualizations
         plt.style.use('dark_background')
+        chart_color = '#00ffcc' if "Safe" in engine_choice or "Swarm" in engine_choice else '#ffcc00'
         
-        # 1. Cumulative Equity Curve
+        # GRAPH 1: Cumulative Equity Curve
         st.subheader("1. Portfolio Equity Curve")
         fig1, ax1 = plt.subplots(figsize=(14, 4))
         fig1.patch.set_facecolor('#0e1117')
         ax1.set_facecolor('#0e1117')
-        color = '#00ffcc' if "Safe" in engine_choice or "Swarm" in engine_choice else '#ffcc00'
-        ax1.plot(timestamps, curve, color=color, linewidth=2)
+        ax1.plot(timestamps, curve, color=chart_color, linewidth=2)
         ax1.axhline(y=port['initial_balance'], color='red', linestyle='--', alpha=0.5, label='Initial Balance')
         ax1.tick_params(colors='white')
         for spine in ax1.spines.values(): spine.set_edgecolor('#555555')
@@ -350,8 +350,8 @@ if run_button:
         fig1.autofmt_xdate()
         st.pyplot(fig1)
 
-        # 2. Underwater Drawdown Curve
-        st.subheader("2. Underwater Curve (Drawdown %)")
+        # GRAPH 2: Underwater Drawdown Curve
+        st.subheader("2. Underwater Curve (Risk of Ruin)")
         fig2, ax2 = plt.subplots(figsize=(14, 3))
         fig2.patch.set_facecolor('#0e1117')
         ax2.set_facecolor('#0e1117')
@@ -364,21 +364,23 @@ if run_button:
         fig2.autofmt_xdate()
         st.pyplot(fig2)
         
-        # 3. Trade Distribution (Chronological PnL)
-        st.subheader("3. Chronological Trade PnL Distribution")
-        fig3, ax3 = plt.subplots(figsize=(14, 4))
-        fig3.patch.set_facecolor('#0e1117')
-        ax3.set_facecolor('#0e1117')
-        
-        colors = ['#00ffcc' if pnl > 0 else '#ff3333' for pnl in trade_pnls]
-        ax3.bar(range(1, len(trade_pnls) + 1), trade_pnls, color=colors, alpha=0.8)
-        ax3.axhline(y=0, color='#ffffff', linewidth=1, alpha=0.5)
-        ax3.set_xlabel("Trade Number", color='white')
-        ax3.set_ylabel("Realized PnL (USD)", color='white')
-        ax3.tick_params(colors='white')
-        for spine in ax3.spines.values(): spine.set_edgecolor('#555555')
-        ax3.grid(True, axis='y', linestyle='--', alpha=0.2, color='#555555')
-        st.pyplot(fig3)
-        
+        # GRAPH 3: Chronological Trade PnL Distribution
+        st.subheader("3. Sequential Trade Analysis (PnL)")
+        if trade_pnls:
+            fig3, ax3 = plt.subplots(figsize=(14, 4))
+            fig3.patch.set_facecolor('#0e1117')
+            ax3.set_facecolor('#0e1117')
+            bar_colors = ['#00ffcc' if pnl > 0 else '#ff3333' for pnl in trade_pnls]
+            ax3.bar(range(1, len(trade_pnls) + 1), trade_pnls, color=bar_colors, alpha=0.8)
+            ax3.axhline(y=0, color='#ffffff', linewidth=1, alpha=0.5)
+            ax3.set_xlabel("Sequential Trade ID", color='white')
+            ax3.set_ylabel("Realized PnL (USD)", color='white')
+            ax3.tick_params(colors='white')
+            for spine in ax3.spines.values(): spine.set_edgecolor('#555555')
+            ax3.grid(True, axis='y', linestyle='--', alpha=0.2, color='#555555')
+            st.pyplot(fig3)
+        else:
+            st.warning("No trades were executed during this period to graph.")
+            
 else:
-    st.info("👈 Select a trading engine from the sidebar and click 'Run Backtest' to begin the analysis.")
+    st.info("👈 Select a strategy from the sidebar and execute the backtest.")
